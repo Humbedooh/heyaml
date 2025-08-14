@@ -24,7 +24,6 @@ The simplest way to install and use heyaml is with [`uv`](https://github.com/ast
 ```shell
 git clone https://github.com/Humbedooh/heyaml.git
 cd heyaml
-uv init
 uv run heyaml.py -h
 ```
 
