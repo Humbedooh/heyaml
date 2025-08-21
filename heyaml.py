@@ -19,88 +19,159 @@ import os
 import subprocess
 import tempfile
 import argparse
+import hashlib
+import io
 
-GPG_FORMAT = """
------BEGIN PGP MESSAGE-----
-Version: 2.6.2
 
-%s
------END PGP MESSAGE-----
-"""
-
-HIERA_FORMAT = """ENC[GPG,%s]"""
-HIERA_UNKNOWN_SECRET = "*** [HEYAML: UNABLE TO DECRYPT THIS SECRET, OVERRIDE ONLY] ***"
+BLAKE_LEN = 8
 FALLBACK_EDITOR = "nano"
+YAML_WIDTH = 16 * 1024
 
-class YAML:
-    def __init__(self):
-        self.parser = ruamel.yaml.YAML(typ='safe', pure=True)
-        self.parser.width = 100
+
+class YamlTag:
+    """A class that represents a type of enclosing tag for denoting a certain type of data"""
+    def __init__(self, open_tag: str, close_tag: str):
+        self.tag_open = open_tag
+        self.tag_close = close_tag
+
+    def match(self, data: str):
+        """Tests whether a string value matches a tag specification. If matched, returns the enclosed string value, otherwise None"""
+        if data.startswith(self.tag_open) and data.endswith(self.tag_close):
+            return data[len(self.tag_open) : -len(self.tag_close)]
+        return None
+
+    def enclose(self, data: str):
+        """Encloses a string value in the tag format"""
+        return f"{self.tag_open}{data}{self.tag_close}"
+
+
+HEYAML_TAG_ENCRYPT = YamlTag(open_tag="ENC{{", close_tag="}}")
+HIERA_TAG_ENCRYPTED_GPG = YamlTag(open_tag="ENC[GPG,", close_tag="]")
+HEYAML_TAG_PLACEHOLDER = YamlTag(open_tag="*** [HEYAML:", close_tag=": UNABLE TO DECRYPT THIS SECRET, OVERRIDE ONLY] ***")
+GPG_TAG = YamlTag(open_tag="\n-----BEGIN PGP MESSAGE-----\nVersion: 2.6.2\n\n", close_tag="\n-----END PGP MESSAGE-----\n")
+
+class CryptException(BaseException):
+    pass
+
+
+class CryptYAML:
+    def __init__(self, original_eyaml: str = "", expected_recipients: list | set = []):
+        self.parser = ruamel.yaml.YAML(typ="safe", pure=True)
+        self.parser.width = YAML_WIDTH
         self.parser.default_flow_style = False
         self.parser.indent(mapping=2, offset=2)
         self.parser.representer.add_representer(str, self.str_repr)
+        self.parser.constructor.add_constructor("tag:yaml.org,2002:str", self.str_construct)
+        self.recipient_diff = set()
+        self.expected_recipients = {}
+        self.original_eyaml = original_eyaml
+        self.secrets = {}
+        self.is_encrypting = False
+        if expected_recipients:
+            for identifier in expected_recipients:
+                self.expected_recipients[identifier] = []
+                for key in gpg.list_keys(keys=identifier):
+                    self.expected_recipients[identifier].append(key["keyid"])
+                    self.expected_recipients[identifier].extend([k for k in key.get("subkey_info", {}).keys()])
+        if self.original_eyaml:
+            self.decrypted_yaml = self.decrypt()
+        else:
+            self.decrypted_yaml = {}
 
-    @staticmethod
-    def str_repr(dumper, data):
+    def decrypt(self):
+        decrypted_dict = self.parser.load(self.original_eyaml)
+        return decrypted_dict
+
+    def encrypt(self, yml: dict, filename: str):
+        self.is_encrypting = True
+        tmpio = io.StringIO()
+        try:
+            self.parser.dump(yml, tmpio)
+        except CryptException as e:
+            print(f"Could not encrypt document {filename}: {e}")
+            sys.exit(-1)
+        with open(filename, "w") as f:
+            f.write(tmpio.getvalue())
+
+    def print_diff(self):
+        difftxt = ""
+        if self.recipient_diff:
+            for el in self.recipient_diff:
+                if el.startswith("-"):
+                    difftxt += f"- Content encrypted for {el[1:]} but key is no longer in hiera-eyaml-gpg.recipients\n"
+                else:
+                    difftxt += f"- Content not encrypted for {el[1:]} but address was found in hiera-eyaml-gpg.recipients\n"
+        return difftxt
+
+    def tempedit(self) -> dict:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            if self.decrypted_yaml:
+                self.is_encrypting = False
+                self.parser.dump(self.decrypted_yaml, f)
+            f.close()
+            proc = subprocess.Popen(
+                (
+                    os.environ.get("EDITOR", FALLBACK_EDITOR),
+                    f.name,
+                )
+            )
+            proc.wait()
+            newyaml = self.parser.load(open(f.name).read())
+            os.unlink(f.name)
+            return newyaml
+
+    def str_construct(self, node, tag):
+        if not self.is_encrypting and (ft := HIERA_TAG_ENCRYPTED_GPG.match(tag.value)):
+            recips = gpg.get_recipients(GPG_TAG.enclose(ft))
+            if self.expected_recipients:
+                for expected_email, expected_keys in self.expected_recipients.items():
+                    if not any(key in recips for key in expected_keys):
+                        self.recipient_diff.add(f"+{expected_email}")  # email needs to be added to crypt list
+                for recip in recips:
+                    if all(recip not in keys for keys in self.expected_recipients.values()):
+                        self.recipient_diff.add(f"-{recip}")  # Key needs to be removed from crypt list
+            cryptobject = gpg.decrypt(GPG_TAG.enclose(ft))
+            if cryptobject.ok:
+                tag.value = HEYAML_TAG_ENCRYPT.enclose(str(cryptobject))
+            else:
+                blakeid = hashlib.blake2s(tag.value.encode("utf-8"), digest_size=BLAKE_LEN).hexdigest()
+                self.secrets[blakeid] = str(ft)
+                tag.value = HEYAML_TAG_PLACEHOLDER.enclose(blakeid)
+        return tag.value
+
+    def str_repr(self, dumper, data):
+        self.parser.width = YAML_WIDTH
+        if self.is_encrypting:
+            if blakeid := HEYAML_TAG_PLACEHOLDER.match(data):
+                self.parser.width = 16 * 1024
+                if blakeid in self.secrets:
+                    print(f"Notice: could not decrypt original value for {blakeid}, leaving intact and not re-encrypting")
+                    data = self.secrets[blakeid].strip()
+                    return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="")
+                else:
+                    print(f"MISSING: {blakeid}")
+            elif to_encrypt := HEYAML_TAG_ENCRYPT.match(data):
+                encrypted_data = gpg.encrypt(to_encrypt, recipients=list(self.expected_recipients.keys()))
+                if encrypted_data.ok:
+                    encrypted_data = "".join(str(encrypted_data).splitlines()[2:][:-2])
+                else:
+                    raise CryptException(encrypted_data.status_detail)
+                data = HIERA_TAG_ENCRYPTED_GPG.enclose(encrypted_data)
         if len(data.splitlines()) > 1:  # If this is a multiline string, use the pipe indicator
-            return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='|')
+            return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
         # If single-line string, just use default style
-        return dumper.represent_scalar('tag:yaml.org,2002:str', data)
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data)
+
 
 gpg = gnupg.GPG()
-yaml = YAML().parser
 
-def decrypt_dict(yml: dict, expected_recips=None):
-    decrypted_dict = {}
-    recipient_diff = set()
-    for k, v in yml.items():
-        to_decrypt = v[8:][:-1]
-        recips = gpg.get_recipients(GPG_FORMAT % to_decrypt)
-        if expected_recips:
-            for expected_email, expected_keys in expected_recips.items():
-                if not any(key in recips for key in expected_keys):
-                    recipient_diff.add(f"+{expected_email}") # email needs to be added to crypt list
-            for recip in recips:
-                if all(recip not in keys for keys in expected_recips.values()):
-                    recipient_diff.add(f"-{recip}")  # Key needs to be removed from crypt list
-        cryptobject = gpg.decrypt(GPG_FORMAT % to_decrypt)
-        if cryptobject.ok:
-            decrypted_dict[k] = str(cryptobject)
-        else:
-            decrypted_dict[k] = HIERA_UNKNOWN_SECRET
-    return decrypted_dict, recipient_diff
-
-def encrypt_dict(yml: dict, recipients: list, original_yaml: dict = None):
-    encrypted_dict = {}
-    for k, v in yml.items():
-        if v == HIERA_UNKNOWN_SECRET:
-            if k in original_yaml:
-                encrypted_dict[k] = original_yaml[k]
-                print(f"Notice: could not decrypt original value for {k}, leaving intact and not re-encrypting")
-            elif k:
-                sys.stderr.write(f"Could not find original value of key {k}!")
-
-        else:
-            encrypted_dict[k] = HIERA_FORMAT % "".join(str(gpg.encrypt(v, recipients=recipients)).split("\n")[2:][:-2])
-    return encrypted_dict
-
-def tempedit(yml: dict) -> dict:
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-        if yml:
-            yaml.dump(yml, f)
-        f.close()
-        proc = subprocess.Popen((os.environ.get("EDITOR", FALLBACK_EDITOR), f.name,))
-        proc.wait()
-        newyaml = yaml.load(open(f.name).read())
-        os.unlink(f.name)
-        return newyaml
 
 def main():
     cwd = os.getcwd()
     homedir = os.getenv("GNUPGHOME", os.path.join(os.getenv("HOME", cwd), ".gnupg"))
     parser = argparse.ArgumentParser(prog="heyaml.py")
-    parser.add_argument('-p', '--puppetdir', help=f"Path to the base puppet git dir, if not current dir ({cwd})", default=cwd)
-    parser.add_argument('-g', '--gpghome', help=f"Path to the GPG homedir (otherwise uses {homedir})", default=homedir)
+    parser.add_argument("-p", "--puppetdir", help=f"Path to the base puppet git dir, if not current dir ({cwd})", default=cwd)
+    parser.add_argument("-g", "--gpghome", help=f"Path to the GPG homedir (otherwise uses {homedir})", default=homedir)
     parser.add_argument("action", choices=("cat", "create", "edit", "recrypt", "validate"))
     parser.add_argument("filename", help="Path to the EYAML file(s) to open", nargs="*")
 
@@ -109,62 +180,48 @@ def main():
     if args.gpghome:
         gpg.gnupghome = args.gpghome
 
+    # Read puppet encryption recipients file
+    puppet_recips = os.path.join(args.puppetdir, "data/hiera-eyaml-gpg.recipients")
+    recipient_emails = [x for x in open(puppet_recips).read().split("\n") if x]
+
     for filename in args.filename:
 
         # Load EYAML file if applicable and available
         if os.path.isfile(filename):
-            inyaml = yaml.load(open(filename).read())
+            cyaml = CryptYAML(original_eyaml=open(filename).read(), expected_recipients=recipient_emails)
+            inyaml = cyaml.decrypt()
         elif args.action in ("cat", "recrypt"):
             sys.stderr.write(f"File not found: {filename}")
             sys.exit(-1)
         else:
             inyaml = {}  # Blank canvas if 'edit' on a new file
-
-        # Read puppet encryption recipients file
-        puppet_recips = os.path.join(args.puppetdir, "data/hiera-eyaml-gpg.recipients")
-        recipient_emails = [x for x in open(puppet_recips).read().split("\n") if x]
-        recipient_dict = {}
-        for email in recipient_emails:
-            recipient_dict[email] = []
-            for key in gpg.list_keys(keys=email):
-                recipient_dict[email].append(key["keyid"])
-                recipient_dict[email].extend([k for k in key.get("subkey_info", {}).keys()])
-
-
-        # Decrypt $filename to a dict
-        yaml_decrypted, recipient_diff = decrypt_dict(inyaml, expected_recips=recipient_dict)
-
-
         if args.action == "cat":
-            yaml.dump(yaml_decrypted, sys.stdout)
+            cyaml.parser.dump(inyaml, sys.stdout)
         elif args.action == "validate":
-            if recipient_diff:
-                print(f"{filename} targets do not match hiera-eyaml-gpg.recipients:")
-                for el in recipient_diff:
-                    if el.startswith("-"):
-                        print(f"- Content encrypted for {el[1:]} but key is no longer in hiera-eyaml-gpg.recipients")
-                    else:
-                        print(f"- Content not encrypted for {el[1:]} but address was found in hiera-eyaml-gpg.recipients")
+            diff = cyaml.print_diff()
+            if diff:
+                print(f"{filename} is valid, but encryption does not match hiera-eyaml-gpg.recipients:")
+                print(diff)
                 sys.exit(-1)  # exit -1 so shells can catch when diffs happen
             else:
-                print(f"{filename} targets matches hiera-eyaml-gpg.recipients")
+                print(f"{filename} is valid and encryption matches hiera-eyaml-gpg.recipients:")
 
         elif args.action == "recrypt":
-            yaml_encrypted = encrypt_dict(yaml_decrypted, recipients=recipient_emails, original_yaml=inyaml)
-            with open(filename, "w") as f:
-                yaml.dump(yaml_encrypted, f)
-                print(f"Re-encrypted {filename} to the following recipients: {', '.join(recipient_emails)}")
+            cyaml.encrypt(inyaml, filename)
+            print(f"Re-encrypted {filename} to the following recipients: {', '.join(recipient_emails)}")
         elif args.action in ("edit", "create"):
-            new_yaml_decrypted = tempedit(yaml_decrypted)
-            if new_yaml_decrypted and (new_yaml_decrypted != yaml_decrypted or recipient_diff):
-                if new_yaml_decrypted == yaml_decrypted and recipient_diff:
-                    print("YAML contents unchanged, but recipients have changed since file was last encrypted, re-encrypting file for good measure.")
-                yaml_encrypted = encrypt_dict(new_yaml_decrypted, recipients=recipient_emails, original_yaml=inyaml)
-                with open(filename, "w") as f:
-                    yaml.dump(yaml_encrypted, f)
-                    print(f"Successfully saved changes to {filename}")
+            new_yaml_decrypted = cyaml.tempedit()
+            if new_yaml_decrypted and (new_yaml_decrypted != inyaml or cyaml.recipient_diff):
+                if new_yaml_decrypted == inyaml and cyaml.recipient_diff:
+                    print(
+                        "YAML contents unchanged, but recipients have changed since file was last encrypted:"
+                    )
+
+                cyaml.encrypt(new_yaml_decrypted, filename)
+                print(f"Successfully saved changes to {filename}")
             else:
-                print("No changes detected")
+                print("No changes detected, nothing to do.")
+
 
 if __name__ == "__main__":
     main()
