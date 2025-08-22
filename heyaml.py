@@ -49,6 +49,17 @@ HEYAML_TAG_ENCRYPT = YamlTag(open_tag="ENC{{", close_tag="}}")
 HIERA_TAG_ENCRYPTED_GPG = YamlTag(open_tag="ENC[GPG,", close_tag="]")
 HEYAML_TAG_PLACEHOLDER = YamlTag(open_tag="*** [HEYAML:", close_tag=": UNABLE TO DECRYPT THIS SECRET, OVERRIDE ONLY] ***")
 GPG_TAG = YamlTag(open_tag="\n-----BEGIN PGP MESSAGE-----\nVersion: 2.6.2\n\n", close_tag="\n-----END PGP MESSAGE-----\n")
+HEYAML_PREAMBLE = """
+# This is the decrypted YAML document, to the extent that Heyaml can decrypt it.
+# Any string values that should be encrypted in the resulting EYAML document are
+# denoted with the ENC{{}} tag enclosing it, for instance: ENC{{secret goes here}}
+# Any string value not inside an ENC{{}} tag will be written into EYAML as plain-text.
+#
+# Values that could not be decrypted are replaced by a placeholder tag with a reference
+# to the original encrypted text. If the tag is not modified or replaced with another
+# value, the tag will revert back to the original encrypted text upon exiting the editor.
+
+"""
 
 class CryptException(BaseException):
     pass
@@ -105,6 +116,7 @@ class CryptYAML:
 
     def tempedit(self) -> dict:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(HEYAML_PREAMBLE.lstrip())
             if self.decrypted_yaml:
                 self.is_encrypting = False
                 self.parser.dump(self.decrypted_yaml, f)
