@@ -21,6 +21,7 @@ import tempfile
 import argparse
 import hashlib
 import io
+import requests
 
 
 BLAKE_LEN = 8
@@ -80,6 +81,17 @@ class CryptYAML:
         self.is_encrypting = False
         if expected_recipients:
             for identifier in expected_recipients:
+                # We can use external GPG keys over HTTPS as well as email address identifiers:
+                if identifier.startswith("https://"):
+                    gpg_data = requests.get(identifier)
+                    gpg_data.raise_for_status()
+                    remote_keys: gnupg.ImportResult = gpg.import_keys(gpg_data.text)
+                    new_identifier = remote_keys.fingerprints[0]
+                    if any("Entirely new key" in entry['text'] for entry in remote_keys.results):
+                        if not input(f"GPG key {new_identifier} from {identifier} is new, press enter to trust it or ctrl+c to cancel out: "):
+                            print(f"Trusting {new_identifier} with TRUST_ULTIMATE.")
+                            gpg.trust_keys(new_identifier, "TRUST_ULTIMATE")
+                    identifier = new_identifier
                 self.expected_recipients[identifier] = []
                 for key in gpg.list_keys(keys=identifier):
                     self.expected_recipients[identifier].append(key["keyid"])
