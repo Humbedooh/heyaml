@@ -46,3 +46,26 @@ options:
 ```
 
 `heyaml` supports batching operations, either by listing multiple filenames to perform an action on, or by using Glob syntax.
+
+`heyaml` is designed for work with Hiera EYAML in a Puppet environment, and so will look for the 
+`data/hiera-eyaml-gpg.recipients` file for a list of recipients. You can also specify the path to 
+any recipients file using the -r (--recipients) flag:
+
+~~~bash
+uv run heyaml.py -r /path/to/recipients.txt edit foo/bar.eyaml
+~~~
+
+The recipients list can be either a list of email addresses, a list of PGP key fingerprints, or 
+external PGP key files using HTTPS URLs:
+
+~~~text
+# key in our keychain, identified by an email address
+humbedooh@apache.org
+
+# key loaded from external URL
+https://github.com/Humbedooh.gpg
+https://github.com/Humbedooh-two.gpg
+
+# key from chain, defined by fingerprint
+D2D94620F65C4988D8495324D91B182C0F85ECD4
+~~~
