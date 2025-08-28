@@ -68,7 +68,7 @@ class CryptException(BaseException):
 
 
 class CryptYAML:
-    def __init__(self, original_eyaml: str = "", expected_recipients: list | set = []):
+    def __init__(self, original_eyaml: str = "", expected_recipients: str|os.PathLike = None):
         self.parser = ruamel.yaml.YAML(typ="safe", pure=True)
         self.parser.width = YAML_WIDTH
         self.parser.default_flow_style = False
@@ -81,7 +81,7 @@ class CryptYAML:
         self.secrets = {}
         self.is_encrypting = False
         if expected_recipients:
-            for identifier in expected_recipients:
+            for identifier in [line.strip() for line in open(expected_recipients).readlines()]:
                 # We can use external GPG keys over HTTPS as well as email address identifiers:
                 if identifier.startswith("https://"):
                     gpg_data = requests.get(identifier)
@@ -92,11 +92,11 @@ class CryptYAML:
                         for key in gpg.list_keys(keys=new_identifier):
                             if key["trust"] not in  ("f", "u"): #
                                 if not input(f"GPG key {new_identifier} from {identifier} is new, press enter to trust it or ctrl+c to cancel out: "):
-                                    print(f"Trusting {new_identifier} with TRUST_ULTIMATE.")
+                                    sys.stderr.write(f"[INFO] Trusting {new_identifier} with TRUST_ULTIMATE.")
                                     gpg.trust_keys(new_identifier, "TRUST_ULTIMATE")
                         identifier = new_identifier
                     else:
-                        print(f"GPG key {identifier} is empty, ignoring.")
+                        sys.stderr.write(f"[WARNING] GPG reference {identifier} in {expected_recipients} is blank, ignoring.\n")
                         continue
                 self.expected_recipients[identifier] = []
                 for key in gpg.list_keys(keys=identifier):
@@ -202,6 +202,7 @@ def main():
     homedir = os.getenv("GNUPGHOME", os.path.join(os.getenv("HOME", cwd), ".gnupg"))
     parser = argparse.ArgumentParser(prog="heyaml.py")
     parser.add_argument("-p", "--puppetdir", help=f"Path to the base puppet git dir, if not current dir ({cwd})", default=cwd)
+    parser.add_argument("-r", "--recipients", help=f"Path to the hiera recipients list. Supersedes the --puppetdir option if specified")
     parser.add_argument("-g", "--gpghome", help=f"Path to the GPG homedir (otherwise uses {homedir})", default=homedir)
     parser.add_argument("action", choices=("cat", "create", "edit", "recrypt", "validate"))
     parser.add_argument("filename", help="Path to the EYAML file(s) to open", nargs="*")
@@ -212,14 +213,13 @@ def main():
         gpg.gnupghome = args.gpghome
 
     # Read puppet encryption recipients file
-    puppet_recips = os.path.join(args.puppetdir, "data/hiera-eyaml-gpg.recipients")
-    recipient_emails = [x for x in open(puppet_recips).read().split("\n") if x]
+    puppet_recips = args.recipients or os.path.join(args.puppetdir, "data/hiera-eyaml-gpg.recipients")
 
     for filename in args.filename:
 
         # Load EYAML file if applicable and available
         if os.path.isfile(filename):
-            cyaml = CryptYAML(original_eyaml=open(filename).read(), expected_recipients=recipient_emails)
+            cyaml = CryptYAML(original_eyaml=open(filename).read(), expected_recipients=puppet_recips)
             inyaml = cyaml.decrypt()
         elif args.action in ("cat", "recrypt"):
             sys.stderr.write(f"File not found: {filename}")
