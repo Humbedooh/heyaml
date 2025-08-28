@@ -12,6 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 """heyaml.py - a Python interface for managing Hiera EYAML secrets"""
+
 import gnupg
 import ruamel.yaml
 import sys
@@ -86,17 +87,23 @@ class CryptYAML:
                     gpg_data = requests.get(identifier)
                     gpg_data.raise_for_status()
                     remote_keys: gnupg.ImportResult = gpg.import_keys(gpg_data.text)
-                    new_identifier = remote_keys.fingerprints[0]
-                    if any("Entirely new key" in entry['text'] for entry in remote_keys.results):
-                        if not input(f"GPG key {new_identifier} from {identifier} is new, press enter to trust it or ctrl+c to cancel out: "):
-                            print(f"Trusting {new_identifier} with TRUST_ULTIMATE.")
-                            gpg.trust_keys(new_identifier, "TRUST_ULTIMATE")
-                    identifier = new_identifier
+                    if remote_keys.fingerprints:
+                        new_identifier = remote_keys.fingerprints[0]
+                        for key in gpg.list_keys(keys=new_identifier):
+                            if key["trust"] not in  ("f", "u"): #
+                                if not input(f"GPG key {new_identifier} from {identifier} is new, press enter to trust it or ctrl+c to cancel out: "):
+                                    print(f"Trusting {new_identifier} with TRUST_ULTIMATE.")
+                                    gpg.trust_keys(new_identifier, "TRUST_ULTIMATE")
+                        identifier = new_identifier
+                    else:
+                        print(f"GPG key {identifier} is empty, ignoring.")
+                        continue
                 self.expected_recipients[identifier] = []
                 for key in gpg.list_keys(keys=identifier):
                     self.expected_recipients[identifier].append(key["keyid"])
                     self.expected_recipients[identifier].extend([k for k in key.get("subkey_info", {}).keys()])
         if self.original_eyaml:
+
             self.decrypted_yaml = self.decrypt()
         else:
             self.decrypted_yaml = {}
@@ -232,7 +239,11 @@ def main():
 
         elif args.action == "recrypt":
             cyaml.encrypt(inyaml, filename)
-            print(f"Re-encrypted {filename} to the following recipients: {', '.join(recipient_emails)}")
+            encrypted_to = []
+            for key in gpg.list_keys(keys=cyaml.expected_recipients.keys()):
+                if key["uids"]:
+                    encrypted_to.append(key["uids"][0])
+            print(f"Re-encrypted {filename} to the following recipients: {', '.join(encrypted_to)}")
         elif args.action in ("edit", "create"):
             new_yaml_decrypted = cyaml.tempedit()
             if new_yaml_decrypted and (new_yaml_decrypted != inyaml or cyaml.recipient_diff):
