@@ -81,7 +81,7 @@ class CryptYAML:
         self.secrets = {}
         self.is_encrypting = False
         if expected_recipients:
-            for identifier in [line.strip() for line in open(expected_recipients).readlines()]:
+            for identifier in [line.strip() for line in open(expected_recipients).readlines() if not line.startswith("#")]:
                 # We can use external GPG keys over HTTPS as well as email address identifiers:
                 if identifier.startswith("https://"):
                     gpg_data = requests.get(identifier)
