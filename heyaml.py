@@ -50,7 +50,7 @@ class YamlTag:
 HEYAML_TAG_ENCRYPT = YamlTag(open_tag="ENC{{", close_tag="}}")
 HIERA_TAG_ENCRYPTED_GPG = YamlTag(open_tag="ENC[GPG,", close_tag="]")
 HEYAML_TAG_PLACEHOLDER = YamlTag(open_tag="*** [HEYAML:", close_tag=": UNABLE TO DECRYPT THIS SECRET, OVERRIDE ONLY] ***")
-GPG_TAG = YamlTag(open_tag="\n-----BEGIN PGP MESSAGE-----\nVersion: 2.6.2\n\n", close_tag="\n-----END PGP MESSAGE-----\n")
+GPG_TAG = YamlTag(open_tag="\n-----BEGIN PGP MESSAGE-----\nVersion: 2.6.2\n\n", close_tag="\n\n-----END PGP MESSAGE-----\n")
 HEYAML_PREAMBLE = """
 # This is the decrypted YAML document, to the extent that Heyaml can decrypt it.
 # Any string values that should be encrypted in the resulting EYAML document are
@@ -177,7 +177,7 @@ class CryptYAML:
                 self.parser.width = 16 * 1024
                 if blakeid in self.secrets:
                     print(f"Notice: could not decrypt original value for {blakeid}, leaving intact and not re-encrypting")
-                    data = self.secrets[blakeid].strip()
+                    data = HIERA_TAG_ENCRYPTED_GPG.enclose(self.secrets[blakeid].strip())
                     return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="")
                 else:
                     print(f"MISSING: {blakeid}")
@@ -238,6 +238,7 @@ def main():
                 print(f"{filename} is valid and encryption matches hiera-eyaml-gpg.recipients:")
 
         elif args.action == "recrypt":
+            cyaml.is_encrypting = True
             cyaml.encrypt(inyaml, filename)
             encrypted_to = []
             for key in gpg.list_keys(keys=cyaml.expected_recipients.keys()):
